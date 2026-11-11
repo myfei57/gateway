@@ -19,6 +19,7 @@ import (
 	egv1a1 "github.com/envoyproxy/gateway/api/v1alpha1"
 	"github.com/envoyproxy/gateway/internal/gatewayapi/resource"
 	"github.com/envoyproxy/gateway/internal/ir"
+	"github.com/envoyproxy/gateway/internal/xds/budget"
 )
 
 // ProviderResources message
@@ -36,6 +37,11 @@ type ProviderResources struct {
 
 	// ExtensionStatuses is a group of gw-api extension resource statuses map.
 	ExtensionStatuses
+
+	// XdsBudgetStatuses holds the latest XdsResourceBudget evaluation report per
+	// proxy infrastructure key. A report with Published=false means the candidate
+	// generation was rejected and Envoy is still serving the last good snapshot.
+	XdsBudgetStatuses watchable.Map[string, *budget.Report]
 }
 
 func (p *ProviderResources) GetResources() []*resource.Resources {
@@ -77,6 +83,7 @@ func (p *ProviderResources) Close() {
 	p.GatewayAPIStatuses.Close()
 	p.PolicyStatuses.Close()
 	p.ExtensionStatuses.Close()
+	p.XdsBudgetStatuses.Close()
 }
 
 // GatewayAPIStatuses contains gateway API resources statuses

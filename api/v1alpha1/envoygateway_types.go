@@ -279,6 +279,75 @@ type XDSServer struct {
 	//
 	// +optional
 	MaxReceiveMessageSize *resource.Quantity `json:"maxReceiveMessageSize,omitempty"`
+
+	// ResourceBudget optionally bounds the xDS resources of a candidate snapshot
+	// before it is published to the Envoy proxies. When unset, every translated
+	// ResourceVersionTable is published as-is.
+	//
+	// The budget is evaluated against the final, deduplicated protobuf resources,
+	// so resources appended by extension servers are metered as well. A candidate
+	// that exceeds the budget is not published; Envoy keeps serving the previous
+	// known-good snapshot until a compliant candidate arrives.
+	//
+	// +optional
+	ResourceBudget *XdsResourceBudget `json:"resourceBudget,omitempty"`
+}
+
+// XdsResourceBudget bounds the resources of a single candidate xDS snapshot
+// (one ResourceVersionTable per proxy infrastructure). Limits are evaluated
+// after translation and all extension hooks have run, against the actual
+// protobuf payloads rather than the number of Kubernetes objects, so route
+// expansion across hostnames and matches is accounted for.
+type XdsResourceBudget struct {
+	// PerTypeURL limits resources by xDS type URL. A type URL without an entry
+	// is unbounded. Entries must not repeat the same type URL.
+	//
+	// +optional
+	// +kubebuilder:validation:MinItems=1
+	PerTypeURL []XdsResourceTypeBudget `json:"perTypeURL,omitempty"`
+
+	// MaxReferenceEdges bounds the number of name-based reference edges between
+	// the deduplicated resources of the snapshot, for example listener to
+	// RouteConfiguration, RouteConfiguration to Cluster, Cluster to Secret and
+	// EDS Cluster to ClusterLoadAssignment. References to resources that are
+	// not present in the snapshot are not counted.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxReferenceEdges *int64 `json:"maxReferenceEdges,omitempty"`
+}
+
+// XdsResourceTypeBudget bounds the resources of one xDS type URL within a
+// candidate snapshot. All fields are optional; an unset field means the
+// corresponding dimension is not limited.
+type XdsResourceTypeBudget struct {
+	// TypeURL is the xDS type URL of the resources being limited, for example
+	// "type.googleapis.com/envoy.config.route.v3.RouteConfiguration".
+	TypeURL string `json:"typeURL"`
+
+	// MaxResources bounds the number of unique resources of this type URL.
+	// Resources sharing a name, such as a Cluster or Secret referenced by
+	// multiple routes, are counted once.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxResources *int64 `json:"maxResources,omitempty"`
+
+	// MaxSerializedBytes bounds the sum of the protobuf-serialized byte sizes
+	// of the unique resources of this type URL. The size is measured on the
+	// wire representation, which includes ordered repeated fields and unknown
+	// fields.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxSerializedBytes *int64 `json:"maxSerializedBytes,omitempty"`
+
+	// MaxResourceBytes bounds the protobuf-serialized byte size of any single
+	// resource of this type URL.
+	//
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	MaxResourceBytes *int64 `json:"maxResourceBytes,omitempty"`
 }
 
 // Debounce defines how Envoy Gateway coalesces bursts of resource changes before

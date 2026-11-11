@@ -403,6 +403,43 @@ func validateEnvoyGatewayXDSServer(xdsServer *egv1a1.XDSServer) error {
 		}
 	}
 
+	if err := validateXdsResourceBudget(xdsServer.ResourceBudget); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validateXdsResourceBudget(budget *egv1a1.XdsResourceBudget) error {
+	if budget == nil {
+		return nil
+	}
+
+	seenTypeURLs := make(map[string]struct{})
+	for i, perType := range budget.PerTypeURL {
+		if perType.TypeURL == "" {
+			return fmt.Errorf("xdsServer.resourceBudget.perTypeURL[%d].typeURL must not be empty", i)
+		}
+		if _, ok := seenTypeURLs[perType.TypeURL]; ok {
+			return fmt.Errorf("xdsServer.resourceBudget.perTypeURL must not contain duplicate typeURL %q", perType.TypeURL)
+		}
+		seenTypeURLs[perType.TypeURL] = struct{}{}
+
+		if perType.MaxResources != nil && *perType.MaxResources <= 0 {
+			return fmt.Errorf("xdsServer.resourceBudget.perTypeURL[%s].maxResources must be greater than zero", perType.TypeURL)
+		}
+		if perType.MaxSerializedBytes != nil && *perType.MaxSerializedBytes <= 0 {
+			return fmt.Errorf("xdsServer.resourceBudget.perTypeURL[%s].maxSerializedBytes must be greater than zero", perType.TypeURL)
+		}
+		if perType.MaxResourceBytes != nil && *perType.MaxResourceBytes <= 0 {
+			return fmt.Errorf("xdsServer.resourceBudget.perTypeURL[%s].maxResourceBytes must be greater than zero", perType.TypeURL)
+		}
+	}
+
+	if budget.MaxReferenceEdges != nil && *budget.MaxReferenceEdges <= 0 {
+		return fmt.Errorf("xdsServer.resourceBudget.maxReferenceEdges must be greater than zero")
+	}
+
 	return nil
 }
 

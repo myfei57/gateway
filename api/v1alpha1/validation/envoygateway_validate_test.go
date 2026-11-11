@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	egv1a1 "github.com/envoyproxy/gateway/api/v1alpha1"
@@ -1279,6 +1280,51 @@ func TestValidateEnvoyGatewayXDSServer(t *testing.T) {
 		size := resource.MustParse("0")
 		x := &egv1a1.XDSServer{MaxReceiveMessageSize: &size}
 		require.Error(t, validateEnvoyGatewayXDSServer(x))
+	})
+
+	t.Run("valid resource budget", func(t *testing.T) {
+		x := &egv1a1.XDSServer{ResourceBudget: &egv1a1.XdsResourceBudget{
+			PerTypeURL: []egv1a1.XdsResourceTypeBudget{{
+				TypeURL:            "type.googleapis.com/envoy.config.route.v3.RouteConfiguration",
+				MaxResources:       ptr.To[int64](100),
+				MaxSerializedBytes: ptr.To[int64](1024 * 1024),
+				MaxResourceBytes:   ptr.To[int64](256 * 1024),
+			}},
+			MaxReferenceEdges: ptr.To[int64](1000),
+		}}
+		require.NoError(t, validateEnvoyGatewayXDSServer(x))
+		// A nil budget keeps the gate disabled and is always valid.
+		require.NoError(t, validateXdsResourceBudget(nil))
+	})
+
+	t.Run("invalid resource budget empty type url", func(t *testing.T) {
+		require.Error(t, validateXdsResourceBudget(&egv1a1.XdsResourceBudget{
+			PerTypeURL: []egv1a1.XdsResourceTypeBudget{{TypeURL: "", MaxResources: ptr.To[int64](1)}},
+		}))
+	})
+
+	t.Run("invalid resource budget duplicate type url", func(t *testing.T) {
+		require.Error(t, validateXdsResourceBudget(&egv1a1.XdsResourceBudget{
+			PerTypeURL: []egv1a1.XdsResourceTypeBudget{
+				{TypeURL: "type.googleapis.com/envoy.config.cluster.v3.Cluster", MaxResources: ptr.To[int64](1)},
+				{TypeURL: "type.googleapis.com/envoy.config.cluster.v3.Cluster", MaxResources: ptr.To[int64](2)},
+			},
+		}))
+	})
+
+	t.Run("invalid resource budget non positive limits", func(t *testing.T) {
+		require.Error(t, validateXdsResourceBudget(&egv1a1.XdsResourceBudget{
+			PerTypeURL: []egv1a1.XdsResourceTypeBudget{{TypeURL: "type.googleapis.com/envoy.config.cluster.v3.Cluster", MaxResources: ptr.To[int64](0)}},
+		}))
+		require.Error(t, validateXdsResourceBudget(&egv1a1.XdsResourceBudget{
+			PerTypeURL: []egv1a1.XdsResourceTypeBudget{{TypeURL: "type.googleapis.com/envoy.config.cluster.v3.Cluster", MaxSerializedBytes: ptr.To[int64](-1)}},
+		}))
+		require.Error(t, validateXdsResourceBudget(&egv1a1.XdsResourceBudget{
+			PerTypeURL: []egv1a1.XdsResourceTypeBudget{{TypeURL: "type.googleapis.com/envoy.config.cluster.v3.Cluster", MaxResourceBytes: ptr.To[int64](0)}},
+		}))
+		require.Error(t, validateXdsResourceBudget(&egv1a1.XdsResourceBudget{
+			MaxReferenceEdges: ptr.To[int64](0),
+		}))
 	})
 }
 

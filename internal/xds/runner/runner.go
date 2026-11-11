@@ -40,8 +40,11 @@ import (
 	extension "github.com/envoyproxy/gateway/internal/extension/types"
 	"github.com/envoyproxy/gateway/internal/infrastructure/host"
 	"github.com/envoyproxy/gateway/internal/infrastructure/kubernetes/ratelimit"
+	"github.com/envoyproxy/gateway/internal/ir"
+	"github.com/envoyproxy/gateway/internal/logging"
 	"github.com/envoyproxy/gateway/internal/message"
 	"github.com/envoyproxy/gateway/internal/xds/bootstrap"
+	xdsbudget "github.com/envoyproxy/gateway/internal/xds/budget"
 	"github.com/envoyproxy/gateway/internal/xds/cache"
 	"github.com/envoyproxy/gateway/internal/xds/server/kubejwt"
 	"github.com/envoyproxy/gateway/internal/xds/translator"
@@ -99,6 +102,32 @@ type Runner struct {
 	// they have all exited, ensuring shared state they write to is not
 	// closed out from under them during shutdown.
 	done sync.WaitGroup
+
+	// resourceBudget optionally gates candidate snapshots before they reach the
+	// cache. Nil disables the gate and preserves the original publish path. The
+	// pointer is captured once at Start; every later candidate is re-evaluated
+	// against it, so a configuration change takes effect with the next candidate.
+	resourceBudget *egv1a1.XdsResourceBudget
+
+	// budgetState tracks the candidate generation identity per IR key. It is
+	// only touched by the single subscription goroutine in translateFromSubscription.
+	budgetState map[string]*budgetKeyState
+}
+
+// budgetKeyState distinguishes candidate generations from the last generation
+// that was actually published for one IR key.
+type budgetKeyState struct {
+	// generation increments for every evaluated candidate, including rejects.
+	generation int64
+	// lastGood is the generation of the snapshot currently held by the cache.
+	// Zero means no compliant snapshot has been published for the key yet.
+	lastGood int64
+}
+
+// nextGeneration returns the identity of the candidate currently being gated.
+func (s *budgetKeyState) nextGeneration() int64 {
+	s.generation++
+	return s.generation
 }
 
 func New(cfg *Config) *Runner {
@@ -174,6 +203,14 @@ func (r *Runner) Close() error {
 func (r *Runner) Start(ctx context.Context) error {
 	r.Logger = r.Logger.WithName(r.Name()).WithValues("runner", r.Name())
 	r.cache = cache.NewSnapshotCache(true, r.Logger)
+
+	// Capture the optional resource budget once. A nil budget keeps the original
+	// unconditional publish path; when set, every later candidate is metered and
+	// only fully compliant tables reach the snapshot cache.
+	r.budgetState = make(map[string]*budgetKeyState)
+	if r.EnvoyGateway != nil && r.EnvoyGateway.XDSServer != nil {
+		r.resourceBudget = r.EnvoyGateway.XDSServer.ResourceBudget
+	}
 
 	// Set up the gRPC server and register the xDS handler.
 	// Create SnapshotCache before start subscribeAndTranslate,
@@ -322,6 +359,9 @@ func (r *Runner) translateFromSubscription(sub <-chan watchable.Snapshot[string,
 			)
 
 			if update.Delete {
+				// Drop the generation tracking and rejection report so a later
+				// re-created key starts from generation one again.
+				r.deleteBudgetState(key)
 				if err := r.cache.GenerateNewSnapshot(key, nil, traceCtx); err != nil {
 					traceLogger.Error(err, "failed to delete the snapshot")
 					errChan <- err
@@ -389,6 +429,14 @@ func (r *Runner) translateFromSubscription(sub <-chan watchable.Snapshot[string,
 						if r.cache == nil {
 							r.Logger.Error(err, "failed to init snapshot cache")
 							errChan <- err
+						} else if !r.applyResourceBudget(key, val.XdsIR, result, traceLogger) {
+							// The candidate exceeded the resource budget. The cache is
+							// intentionally left untouched, so Envoy keeps serving the
+							// last good snapshot. This is a stable rejection rather than
+							// a retryable error: nothing is written to errChan and no
+							// message is re-stored, so the runner does not reconcile in a loop.
+							traceLogger.Info("skipped publishing xds resources: resource budget exceeded, retaining the last good snapshot",
+								"key", key)
 						} else {
 							// Update snapshot cache
 							if err := r.cache.GenerateNewSnapshot(key, result.XdsResources, traceCtx); err != nil {
@@ -434,6 +482,77 @@ func (r *Runner) translateFromSubscription(sub <-chan watchable.Snapshot[string,
 		},
 	)
 	r.Logger.Info("subscriber shutting down")
+}
+
+// applyResourceBudget meters the final, fully-built candidate table (including
+// resources appended by extension hooks) and reports whether it may be
+// published. When the budget is disabled it always returns true. On rejection
+// the evaluation report is published into ProviderResources with the
+// candidate generation and Published=false, while the cache is left serving
+// the previous last good snapshot.
+func (r *Runner) applyResourceBudget(
+	key string,
+	xdsIR *ir.Xds,
+	table *xtypes.ResourceVersionTable,
+	logger logging.Logger,
+) bool {
+	if r.resourceBudget == nil {
+		return true
+	}
+
+	state, ok := r.budgetState[key]
+	if !ok {
+		state = &budgetKeyState{}
+		r.budgetState[key] = state
+	}
+	generation := state.nextGeneration()
+
+	// Meter the final table right before the cache boundary, after every
+	// translator phase and extension hook, so no incrementally added resource
+	// can bypass the gate.
+	usage, meterErr := xdsbudget.Meter(table.XdsResources)
+	report := xdsbudget.Evaluate(
+		r.resourceBudget,
+		key,
+		generation,
+		state.lastGood,
+		usage,
+		xdsbudget.CollectSources(xdsIR),
+		meterErr,
+	)
+	xdsbudget.RecordEvaluation(report.Published)
+
+	if report.Published {
+		state.lastGood = generation
+		// The published candidate is itself the new last good snapshot.
+		report.LastGoodGeneration = generation
+		// Keep the successful evaluation visible so consumers can correlate the
+		// published generation with the last good snapshot. Only IR deletion
+		// removes the entry (see deleteBudgetState).
+		r.ProviderResources.XdsBudgetStatuses.Store(key, report)
+		return true
+	}
+
+	for _, violation := range report.Violations {
+		xdsbudget.RecordViolation(violation)
+	}
+	logger.Info("resource budget rejected candidate snapshot",
+		"key", key,
+		"generation", generation,
+		"lastGoodGeneration", state.lastGood,
+		"violations", len(report.Violations),
+	)
+	r.ProviderResources.XdsBudgetStatuses.Store(key, report)
+	return false
+}
+
+// deleteBudgetState resets the generation tracking and rejection report for an
+// IR key, used when the key's IR is deleted.
+func (r *Runner) deleteBudgetState(key string) {
+	delete(r.budgetState, key)
+	if r.ProviderResources != nil {
+		r.ProviderResources.XdsBudgetStatuses.Delete(key)
+	}
 }
 
 func (r *Runner) loadTLSConfig() (*tls.Config, error) {
